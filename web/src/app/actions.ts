@@ -15,26 +15,33 @@ export async function deleteDocument(formData: FormData) {
   const accountId = formData.get('accountId') as string;
   const supabase = createServerClient();
 
-  // Проверяем что документ принадлежит аккаунту
   const { data: doc } = await supabase
     .from('documents')
-    .select('id, account_id, storage_path')
+    .select('id, account_id, storage_path, profile_id')
     .eq('id', documentId)
     .eq('account_id', accountId)
     .single();
 
   if (!doc) return;
 
-  // Удаляем readings
-  await supabase.from('readings').delete().eq('document_id', documentId);
-
-  // Удаляем из Storage
   if (doc.storage_path) {
     await supabase.storage.from('documents').remove([doc.storage_path]);
   }
 
-  // Удаляем документ
+  // readings удалятся каскадно (ON DELETE CASCADE)
   await supabase.from('documents').delete().eq('id', documentId);
+
+  // Если у профиля больше нет документов — удаляем профиль
+  if (doc.profile_id) {
+    const { count } = await supabase
+      .from('documents')
+      .select('id', { count: 'exact', head: true })
+      .eq('profile_id', doc.profile_id);
+
+    if ((count || 0) === 0) {
+      await supabase.from('profiles').delete().eq('id', doc.profile_id);
+    }
+  }
 
   revalidatePath(`/d/${accountId}`);
   redirect(`/d/${accountId}`);
@@ -45,7 +52,6 @@ export async function deleteProfile(formData: FormData) {
   const accountId = formData.get('accountId') as string;
   const supabase = createServerClient();
 
-  // Проверяем что профиль принадлежит аккаунту
   const { data: profile } = await supabase
     .from('profiles')
     .select('id, account_id')
@@ -55,8 +61,23 @@ export async function deleteProfile(formData: FormData) {
 
   if (!profile) return;
 
-  // Удаляем readings → documents обновятся через ON DELETE SET NULL
-  await supabase.from('readings').delete().eq('profile_id', profileId);
+  // Получаем все документы профиля для удаления из Storage
+  const { data: docs } = await supabase
+    .from('documents')
+    .select('id, storage_path')
+    .eq('profile_id', profileId);
+
+  const storagePaths = (docs || []).map(d => d.storage_path).filter(Boolean) as string[];
+  if (storagePaths.length > 0) {
+    await supabase.storage.from('documents').remove(storagePaths);
+  }
+
+  // Удаляем документы (readings каскадируются через ON DELETE CASCADE)
+  if ((docs || []).length > 0) {
+    await supabase.from('documents').delete().in('id', docs!.map(d => d.id));
+  }
+
+  // Удаляем профиль (оставшиеся readings каскадируются через ON DELETE CASCADE)
   await supabase.from('profiles').delete().eq('id', profileId);
 
   revalidatePath(`/d/${accountId}`);
