@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+bot/dist/
+web/.next/
+web/out/
+
+# Environment secrets
+.env
+.env.local
+.env.*.local
+bot/.env
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Next.js
+web/.next/
+web/next-env.d.ts
+
+# PM2
+.pm2/
+
+# Misc
+.turbo/
