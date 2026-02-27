@@ -187,6 +187,33 @@ export async function updateDocument(id: string, updates: Partial<Document>): Pr
   if (error) throw new Error(`Failed to update document: ${error.message}`);
 }
 
+export async function checkDuplicateDocument(
+  accountId: string,
+  patientName: string | null,
+  testDate: string | null,
+  documentType: string | null
+): Promise<boolean> {
+  if (!testDate || !documentType) return false;
+
+  const { data } = await supabase
+    .from('documents')
+    .select('id, parsed_name')
+    .eq('account_id', accountId)
+    .neq('status', 'error')
+    .eq('parsed_date', testDate)
+    .eq('document_type', documentType);
+
+  if (!data || data.length === 0) return false;
+
+  if (!patientName) {
+    // No name on new doc, but same date+type exists — possible duplicate
+    return data.length > 0;
+  }
+
+  const newKey = smartNameKey(patientName);
+  return data.some((doc: any) => doc.parsed_name && smartNameKey(doc.parsed_name) === newKey);
+}
+
 // ============================================
 // Readings
 // ============================================

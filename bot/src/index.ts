@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { Bot, Context, InputFile } from 'grammy';
+import { Bot, Context } from 'grammy';
 import {
   getOrCreateAccount,
   findOrCreateProfile,
@@ -8,18 +8,21 @@ import {
   saveReadings,
   matchBiomarker,
   checkUploadLimit,
+  incrementUploadCount,
   getProfiles,
+  checkDuplicateDocument,
   supabase,
   convertToCanonicalUnit,
   smartNameKey,
 } from './services/supabase';
 import { parseLabDocument } from './services/ai-parser';
+import type { Account, ParsedLabResult } from '../../shared/types';
 
 // ============================================
 // Multi-page document tracking (in-memory, resets on restart)
 // ============================================
 
-const MULTI_PAGE_WINDOW_MS = 5 * 60 * 1000; // 5 минут
+const MULTI_PAGE_WINDOW_MS = 2 * 60 * 1000; // 2 минуты
 
 interface LastUploadState {
   documentId: string;
@@ -27,10 +30,34 @@ interface LastUploadState {
   patientName: string | null;
   labName: string | null;
   testDate: string | null;
+  documentType: string | null;
   timestamp: number;
 }
 
 const lastUploadMap = new Map<string, LastUploadState>();
+
+// ============================================
+// Pending name selection state (Feature 7)
+// ============================================
+
+interface PendingNameState {
+  documentId: string;
+  parsed: ParsedLabResult;
+  model: string | null;
+  tokensIn: number;
+  tokensOut: number;
+  processingTimeMs: number;
+  account: Account;
+  chatId: number;
+  remaining: number;
+  isContinuation: boolean;
+  continuationDocId: string | null;
+  continuationProfileId: string | null;
+  stage: 'select_profile' | 'enter_name';
+  createdAt: number;
+}
+
+const pendingNameMap = new Map<string, PendingNameState>();
 
 // ============================================
 // Bot initialization
@@ -180,260 +207,36 @@ bot.callbackQuery(/^lang_(.+)$/, async (ctx) => {
 });
 
 // ============================================
-// Photo/Document handler — CORE FEATURE
+// Feature 7: Callback handler for profile selection
 // ============================================
 
-async function handleLabUpload(ctx: Context, fileId: string, mimeType: string) {
-  const account = await getOrCreateAccount(
-    ctx.from!.id,
-    ctx.from!.username,
-    ctx.from!.first_name
-  );
+bot.callbackQuery(/^profile:(.+)$/, async (ctx) => {
+  const profileData = ctx.match![1];
+  const account = await getOrCreateAccount(ctx.from!.id, ctx.from!.username);
+  const pending = pendingNameMap.get(account.id);
 
-  // Проверяем лимит загрузок
-  const { allowed, remaining } = await checkUploadLimit(account);
-  if (!allowed) {
-    await ctx.reply(
-      `⚠️ Лимит бесплатных загрузок исчерпан (${account.plan === 'free' ? '3/мес' : '—'}).\n\n` +
-      `Подключи Pro для безлимитных загрузок: /upgrade`,
-    );
+  await ctx.answerCallbackQuery();
+
+  if (!pending) {
+    await ctx.editMessageText('⏱️ Время ожидания истекло. Пожалуйста, загрузите документ ещё раз.');
     return;
   }
 
-  // Сообщаем что начали обработку
-  const statusMsg = await ctx.reply('🔄 Обрабатываю документ... Это займёт 10-30 секунд.');
-
-  try {
-    // 1. Скачиваем файл из Telegram
-    const file = await ctx.api.getFile(fileId);
-    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
-    
-    const response = await fetch(fileUrl);
-    const buffer = Buffer.from(await response.arrayBuffer());
-    const base64 = buffer.toString('base64');
-
-    // 2. Загружаем оригинал в Supabase Storage
-    const storagePath = `${account.id}/${Date.now()}_${file.file_path?.split('/').pop() || 'upload'}`;
-    
-    await supabase.storage
-      .from('documents')
-      .upload(storagePath, buffer, {
-        contentType: mimeType,
-        upsert: false,
-      });
-
-    // 3. Создаём запись документа
-    const doc = await createDocument({
-      accountId: account.id,
-      storagePath,
-      fileType: mimeType,
-      fileSize: buffer.length,
-      source: 'telegram',
-    });
-
-    // 4. Обновляем статус
-    await updateDocument(doc.id, { status: 'processing' });
-
-    // 5. AI парсинг
-    const { result, model, tokensIn, tokensOut, processingTimeMs } = await parseLabDocument(base64, mimeType, undefined, account.locale);
-
-    // 5b. Проверяем: не является ли это продолжением предыдущего документа (в течение 5 мин)
-    const lastState = lastUploadMap.get(account.id);
-    const withinWindow = lastState && (Date.now() - lastState.timestamp) < MULTI_PAGE_WINDOW_MS;
-
-    let isContinuation = false;
-    let continuationDocId: string | null = null;
-    let continuationProfileId: string | null = null;
-
-    if (withinWindow && lastState) {
-      // Считаем продолжением если: имя пациента отсутствует ИЛИ совпадает, И лаборатория совпадает
-      const noName = !result.patient_name;
-      const sameName = result.patient_name && lastState.patientName &&
-        smartNameKey(result.patient_name) === smartNameKey(lastState.patientName);
-      const noLab = !result.lab_name;
-      const sameLab = result.lab_name && lastState.labName &&
-        result.lab_name.toLowerCase().substring(0, 6) === lastState.labName.toLowerCase().substring(0, 6);
-
-      if ((noName || sameName) && (noLab || sameLab)) {
-        isContinuation = true;
-        continuationDocId = lastState.documentId;
-        continuationProfileId = lastState.profileId;
-        // Продлеваем окно для следующих страниц
-        lastUploadMap.set(account.id, { ...lastState, timestamp: Date.now() });
-      }
-    }
-
-    // 6. Находим или создаём профиль (только для нового документа)
-    let profileId: string | null = isContinuation ? continuationProfileId : null;
-    if (!isContinuation && result.patient_name) {
-      const profile = await findOrCreateProfile(account.id, result.patient_name, account.locale);
-      profileId = profile.id;
-    }
-
-    // 7. Создаём/обновляем документ
-    let targetDocId: string;
-    if (isContinuation && continuationDocId) {
-      targetDocId = continuationDocId;
-      // Добавляем страницу в Storage но к тому же документу не добавляем запись
-    } else {
-      await updateDocument(doc.id, {
-        status: 'done',
-        profile_id: profileId,
-        parsed_name: result.patient_name,
-        parsed_date: result.test_date,
-        lab_name: result.lab_name,
-        language: result.language,
-        document_type: result.document_type as any,
-        ai_model: model,
-        ai_tokens_in: tokensIn,
-        ai_tokens_out: tokensOut,
-        processing_time_ms: processingTimeMs,
-        parsed_json: result as any,
-      });
-      targetDocId = doc.id;
-
-      // Запоминаем для многостраничной детекции
-      lastUploadMap.set(account.id, {
-        documentId: doc.id,
-        profileId,
-        patientName: result.patient_name || null,
-        labName: result.lab_name || null,
-        testDate: result.test_date || null,
-        timestamp: Date.now(),
-      });
-    }
-
-    // 8. Сохраняем показатели (с конвертацией единиц и нечётким матчингом биомаркеров)
-    if (result.readings && result.readings.length > 0 && profileId) {
-      const testedAt = result.test_date || (lastState?.testDate) || new Date().toISOString().split('T')[0];
-
-      const readingsToSave = await Promise.all(
-        result.readings.map(async (r) => {
-          const bmMatch = await matchBiomarker(r.name);
-
-          let numericValue: number | null = r.value_numeric ? Number(r.value) : null;
-          let unit = r.unit || undefined;
-          let refMin = r.ref_min || undefined;
-          let refMax = r.ref_max || undefined;
-
-          // Конвертация единиц в canonical если нужно
-          if (bmMatch?.unit_default && numericValue !== null && unit) {
-            const converted = convertToCanonicalUnit(numericValue, unit, bmMatch.unit_default, bmMatch.canonical_name);
-            if (converted.unit !== unit) {
-              // Пересчитываем референсные значения с тем же коэффициентом
-              const factor = converted.value / numericValue;
-              numericValue = converted.value;
-              unit = converted.unit;
-              if (refMin !== undefined) refMin = Math.round(refMin * factor * 10000) / 10000;
-              if (refMax !== undefined) refMax = Math.round(refMax * factor * 10000) / 10000;
-            }
-          }
-
-          return {
-            document_id: targetDocId,
-            profile_id: profileId!,
-            biomarker_id: bmMatch?.id || undefined,
-            original_name: r.name,
-            value: numericValue,
-            value_text: !r.value_numeric ? String(r.value) : null,
-            is_qualitative: !r.value_numeric,
-            unit,
-            ref_min: refMin,
-            ref_max: refMax,
-            flag: r.flag || 'normal',
-            tested_at: testedAt,
-          };
-        })
-      );
-
-      await saveReadings(readingsToSave as any);
-    }
-
-    // Если продолжение — дополнительная страница в Storage не требует отдельного счётчика
-    if (!isContinuation) {
-      // 9. Обновляем счётчик загрузок
-      await supabase
-        .from('accounts')
-        .update({ monthly_uploads: account.monthly_uploads + 1 })
-        .eq('id', account.id);
-    } else {
-      // Помечаем вспомогательный документ как обработанный (он уже создан как pending)
-      await updateDocument(doc.id, { status: 'done', parsed_name: 'Дополнительная страница' });
-    }
-
-    // 10. Формируем ответ
-    const readingsCount = result.readings?.length || 0;
-    const flaggedCount = result.readings?.filter(r => r.flag !== 'normal').length || 0;
-
-    let responseText: string;
-
-    if (isContinuation) {
-      responseText = `📎 *Продолжение анализа добавлено!*\n\n`;
-      responseText += `📊 Добавлено показателей: *${readingsCount}*\n`;
-    } else {
-      responseText = `✅ *Анализ обработан!*\n\n`;
-
-      if (result.patient_name) {
-        responseText += `👤 Пациент: *${result.patient_name}*\n`;
-      }
-      if (result.test_date) {
-        responseText += `📅 Дата: ${result.test_date}\n`;
-      }
-      if (result.lab_name) {
-        responseText += `🏥 Лаборатория: ${result.lab_name}\n`;
-      }
-
-      responseText += `\n📊 Найдено показателей: *${readingsCount}*\n`;
-    }
-
-    if (flaggedCount > 0) {
-      responseText += `⚠️ Вне нормы: *${flaggedCount}*\n\n`;
-
-      const flagged = result.readings?.filter(r => r.flag !== 'normal') || [];
-      for (const r of flagged.slice(0, 10)) {
-        const emoji = r.flag === 'high' ? '🔴↑' : r.flag === 'low' ? '🔵↓' : '⚠️';
-        responseText += `${emoji} ${r.name}: *${r.value}* ${r.unit || ''}\n`;
-      }
-    } else if (!isContinuation) {
-      responseText += `✅ Все показатели в норме\n`;
-    }
-
-    responseText += `\n📊 /dashboard — посмотреть графики`;
-    if (!isContinuation) {
-      responseText += `\n\n_Осталось загрузок: ${remaining - 1} | ${model}_`;
-    }
-
-    // Удаляем сообщение о обработке и отправляем результат
-    await ctx.api.deleteMessage(ctx.chat!.id, statusMsg.message_id);
-    await ctx.reply(responseText, { parse_mode: 'Markdown' });
-
-  } catch (error: any) {
-    console.error('[ERROR] Lab upload failed:', error);
-    await ctx.api.deleteMessage(ctx.chat!.id, statusMsg.message_id);
-    await ctx.reply(
-      `❌ Ошибка обработки: ${error.message}\n\nПопробуй отправить документ ещё раз или в другом формате (фото/PDF).`
-    );
-  }
-}
-
-// Photo handler
-bot.on('message:photo', async (ctx) => {
-  const photo = ctx.message.photo;
-  const largest = photo[photo.length - 1]; // самое большое разрешение
-  await handleLabUpload(ctx, largest.file_id, 'image/jpeg');
-});
-
-// Document handler (PDF)
-bot.on('message:document', async (ctx) => {
-  const doc = ctx.message.document;
-  const allowedTypes = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
-
-  if (!doc.mime_type || !allowedTypes.includes(doc.mime_type)) {
-    await ctx.reply('⚠️ Поддерживаемые форматы: JPG, PNG, PDF. Отправь фото анализа или PDF-файл.');
+  if (Date.now() - pending.createdAt > 10 * 60 * 1000) {
+    pendingNameMap.delete(account.id);
+    await updateDocument(pending.documentId, { status: 'error', error_message: 'timeout' });
+    await ctx.editMessageText('⏱️ Время ожидания истекло. Пожалуйста, загрузите документ ещё раз.');
     return;
   }
 
-  await handleLabUpload(ctx, doc.file_id, doc.mime_type);
+  if (profileData === 'new') {
+    pending.stage = 'enter_name';
+    await ctx.editMessageText('✏️ Введите имя пациента:');
+  } else {
+    pendingNameMap.delete(account.id);
+    await ctx.editMessageText('⏳ Сохраняю анализ...');
+    await completePendingDocument(pending, profileData, null);
+  }
 });
 
 // ============================================
@@ -442,12 +245,15 @@ bot.on('message:document', async (ctx) => {
 
 bot.command('help', async (ctx) => {
   await ctx.reply(
-`🫀 *Biopulse — Помощь*
+`🫀 *Biopulse — Помощь* (@biopulse_lab_bot)
 
 *Как загрузить анализ:*
 1. Сфотографируй результат анализа
 2. Отправь фото в этот чат
 3. Бот распознает все показатели автоматически
+
+*Многостраничные анализы:*
+Отправляй страницы одного анализа подряд в течение 2 минут — бот автоматически объединит их в один документ и спишет только 1 кредит.
 
 *Поддерживаемые форматы:*
 📸 Фото (JPG, PNG)
@@ -472,12 +278,491 @@ _Документы могут быть на любом языке._`,
 });
 
 // ============================================
-// Fallback for text messages
+// Helper: save readings for a document
+// ============================================
+
+async function saveDocumentReadings(
+  parsed: ParsedLabResult,
+  targetDocId: string,
+  profileId: string,
+  fallbackDate?: string | null
+): Promise<void> {
+  if (!parsed.readings || parsed.readings.length === 0) return;
+
+  const testedAt = parsed.test_date || fallbackDate || new Date().toISOString().split('T')[0];
+
+  const readingsToSave = await Promise.all(
+    parsed.readings.map(async (r) => {
+      const bmMatch = await matchBiomarker(r.name);
+
+      let numericValue: number | null = r.value_numeric ? Number(r.value) : null;
+      let unit = r.unit || undefined;
+      let refMin = r.ref_min || undefined;
+      let refMax = r.ref_max || undefined;
+
+      if (bmMatch?.unit_default && numericValue !== null && unit) {
+        const converted = convertToCanonicalUnit(numericValue, unit, bmMatch.unit_default, bmMatch.canonical_name);
+        if (converted.unit !== unit) {
+          const factor = converted.value / numericValue;
+          numericValue = converted.value;
+          unit = converted.unit;
+          if (refMin !== undefined) refMin = Math.round(refMin * factor * 10000) / 10000;
+          if (refMax !== undefined) refMax = Math.round(refMax * factor * 10000) / 10000;
+        }
+      }
+
+      return {
+        document_id: targetDocId,
+        profile_id: profileId,
+        biomarker_id: bmMatch?.id || undefined,
+        original_name: r.name,
+        value: numericValue,
+        value_text: !r.value_numeric ? String(r.value) : null,
+        is_qualitative: !r.value_numeric,
+        unit,
+        ref_min: refMin,
+        ref_max: refMax,
+        flag: r.flag || 'normal',
+        tested_at: testedAt,
+      };
+    })
+  );
+
+  await saveReadings(readingsToSave as any);
+}
+
+// ============================================
+// Helper: build result message
+// ============================================
+
+function buildResultMessage(
+  parsed: ParsedLabResult,
+  isContinuation: boolean,
+  remaining: number,
+  model: string | null,
+  overridePatientName?: string | null
+): string {
+  const readingsCount = parsed.readings?.length || 0;
+  const flaggedCount = parsed.readings?.filter(r => r.flag !== 'normal').length || 0;
+
+  let text: string;
+
+  if (isContinuation) {
+    text = `📎 *Продолжение анализа добавлено!*\n\n`;
+    text += `📊 Добавлено показателей: *${readingsCount}*\n`;
+  } else {
+    text = `✅ *Анализ обработан!*\n\n`;
+
+    const nameToShow = overridePatientName ?? parsed.patient_name;
+    if (nameToShow) text += `👤 Пациент: *${nameToShow}*\n`;
+    if (parsed.test_date) text += `📅 Дата: ${parsed.test_date}\n`;
+    if (parsed.lab_name) text += `🏥 Лаборатория: ${parsed.lab_name}\n`;
+
+    text += `\n📊 Найдено показателей: *${readingsCount}*\n`;
+  }
+
+  if (flaggedCount > 0) {
+    text += `⚠️ Вне нормы: *${flaggedCount}*\n\n`;
+    const flagged = parsed.readings?.filter(r => r.flag !== 'normal') || [];
+    for (const r of flagged.slice(0, 10)) {
+      const emoji = r.flag === 'high' ? '🔴↑' : r.flag === 'low' ? '🔵↓' : '⚠️';
+      text += `${emoji} ${r.name}: *${r.value}* ${r.unit || ''}\n`;
+    }
+  } else if (!isContinuation) {
+    text += `✅ Все показатели в норме\n`;
+  }
+
+  text += `\n📊 /dashboard — посмотреть графики`;
+  if (!isContinuation) {
+    text += `\n\n_Осталось загрузок: ${remaining - 1} | ${model}_`;
+  }
+
+  return text;
+}
+
+// ============================================
+// Helper: complete pending document after name resolved (Feature 7)
+// ============================================
+
+async function completePendingDocument(
+  pending: PendingNameState,
+  profileId: string | null,
+  newName: string | null
+): Promise<void> {
+  const { parsed, account, chatId, isContinuation, continuationDocId, documentId, model, remaining } = pending;
+
+  let resolvedProfileId: string;
+  let resolvedName: string | null = newName;
+
+  if (profileId) {
+    const { data } = await supabase.from('profiles').select('full_name').eq('id', profileId).single();
+    resolvedProfileId = profileId;
+    resolvedName = data?.full_name || null;
+  } else if (newName) {
+    const profile = await findOrCreateProfile(account.id, newName, account.locale);
+    resolvedProfileId = profile.id;
+    resolvedName = profile.full_name;
+  } else {
+    await bot.api.sendMessage(chatId, '❌ Не удалось определить профиль. Попробуйте загрузить документ ещё раз.');
+    return;
+  }
+
+  let targetDocId: string;
+
+  if (isContinuation && continuationDocId) {
+    targetDocId = continuationDocId;
+    await updateDocument(documentId, { status: 'done', parsed_name: 'Дополнительная страница', profile_id: resolvedProfileId });
+  } else {
+    await updateDocument(documentId, {
+      status: 'done',
+      profile_id: resolvedProfileId,
+      parsed_name: resolvedName,
+      parsed_date: parsed.test_date,
+      lab_name: parsed.lab_name,
+      language: parsed.language,
+      document_type: parsed.document_type as any,
+      ai_model: model,
+      ai_tokens_in: pending.tokensIn,
+      ai_tokens_out: pending.tokensOut,
+      processing_time_ms: pending.processingTimeMs,
+      parsed_json: parsed as any,
+    });
+    targetDocId = documentId;
+
+    lastUploadMap.set(account.id, {
+      documentId,
+      profileId: resolvedProfileId,
+      patientName: resolvedName,
+      labName: parsed.lab_name || null,
+      testDate: parsed.test_date || null,
+      documentType: parsed.document_type || null,
+      timestamp: Date.now(),
+    });
+  }
+
+  await saveDocumentReadings(parsed, targetDocId, resolvedProfileId);
+
+  if (!isContinuation) {
+    await incrementUploadCount(account.id, account.monthly_uploads);
+  }
+
+  const text = buildResultMessage(parsed, isContinuation, remaining, model, resolvedName);
+  await bot.api.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+}
+
+// ============================================
+// Core: async document processing
+// ============================================
+
+async function processDocumentAsync(params: {
+  chatId: number;
+  statusMsgId: number;
+  account: Account;
+  remaining: number;
+  documentId: string;
+  base64: string;
+  mimeType: string;
+}): Promise<void> {
+  const { chatId, statusMsgId, account, remaining, documentId, base64, mimeType } = params;
+
+  const deleteSatus = async () => {
+    try { await bot.api.deleteMessage(chatId, statusMsgId); } catch {}
+  };
+
+  try {
+    // 1. AI parsing
+    const { result, model, tokensIn, tokensOut, processingTimeMs } = await parseLabDocument(base64, mimeType, undefined, account.locale);
+
+    // 2. Feature 6: No readings → error, no credit
+    if (!result.readings || result.readings.length === 0) {
+      await updateDocument(documentId, { status: 'error', error_message: 'no_readings' });
+      await deleteSatus();
+      await bot.api.sendMessage(chatId,
+        `❌ Не удалось извлечь показатели из документа.\n\n` +
+        `Попробуйте:\n• Сфотографировать чётче / без бликов\n• Загрузить PDF вместо фото\n• Убедитесь, что это медицинский анализ`
+      );
+      return;
+    }
+
+    // 3. Feature 4: Duplicate check → reject, no credit
+    const isDuplicate = await checkDuplicateDocument(account.id, result.patient_name, result.test_date, result.document_type);
+    if (isDuplicate) {
+      await updateDocument(documentId, { status: 'error', error_message: 'duplicate' });
+      await deleteSatus();
+      await bot.api.sendMessage(chatId,
+        `⚠️ Этот анализ уже загружен.\n\nДубликат не сохранён, кредит не списан.`
+      );
+      return;
+    }
+
+    // 4. Feature 2.2: Multi-page detection (2-minute window, context matching)
+    const lastState = lastUploadMap.get(account.id);
+    const withinWindow = lastState && (Date.now() - lastState.timestamp) < MULTI_PAGE_WINDOW_MS;
+
+    let isContinuation = false;
+    let continuationDocId: string | null = null;
+    let continuationProfileId: string | null = null;
+
+    if (withinWindow && lastState) {
+      const noName = !result.patient_name;
+      const sameName = !!(result.patient_name && lastState.patientName &&
+        smartNameKey(result.patient_name) === smartNameKey(lastState.patientName));
+      const noLab = !result.lab_name;
+      const sameLab = !!(result.lab_name && lastState.labName &&
+        result.lab_name.toLowerCase().substring(0, 6) === lastState.labName.toLowerCase().substring(0, 6));
+      const sameDocType = !!(result.document_type && lastState.documentType &&
+        result.document_type === lastState.documentType);
+      const sameDate = !!(result.test_date && lastState.testDate &&
+        result.test_date === lastState.testDate);
+
+      // Continuation: name matches (or absent) AND at least one context field matches
+      if ((noName || sameName) && (noLab || sameLab || sameDocType || sameDate)) {
+        // Only count as continuation if we have a resolved profile to attach to
+        if (lastState.profileId) {
+          isContinuation = true;
+          continuationDocId = lastState.documentId;
+          continuationProfileId = lastState.profileId;
+          // Extend window for further pages
+          lastUploadMap.set(account.id, { ...lastState, timestamp: Date.now() });
+        }
+      }
+    }
+
+    // 5. Feature 7: No patient name → ask user (only if not continuation with known profile)
+    if (!isContinuation && !result.patient_name) {
+      const profiles = await getProfiles(account.id);
+      await deleteSatus();
+
+      const inlineKeyboard = {
+        inline_keyboard: [
+          ...profiles.map(p => [{ text: p.full_name, callback_data: `profile:${p.id}` }]),
+          [{ text: '➕ Добавить нового человека', callback_data: 'profile:new' }],
+        ],
+      };
+
+      const question = profiles.length > 0
+        ? `🤔 Не удалось определить пациента.\n\nДля кого эти анализы?`
+        : `🤔 Не удалось определить пациента.\n\nКак зовут пациента?`;
+
+      await bot.api.sendMessage(chatId, question, { reply_markup: inlineKeyboard });
+
+      pendingNameMap.set(account.id, {
+        documentId,
+        parsed: result,
+        model,
+        tokensIn,
+        tokensOut,
+        processingTimeMs,
+        account,
+        chatId,
+        remaining,
+        isContinuation: false,
+        continuationDocId: null,
+        continuationProfileId: null,
+        stage: 'select_profile',
+        createdAt: Date.now(),
+      });
+
+      return;
+    }
+
+    // 6. Find or create profile
+    let profileId: string | null = isContinuation ? continuationProfileId : null;
+    if (!isContinuation && result.patient_name) {
+      const profile = await findOrCreateProfile(account.id, result.patient_name, account.locale);
+      profileId = profile.id;
+    }
+
+    // 7. Update document / handle continuation
+    let targetDocId: string;
+
+    if (isContinuation && continuationDocId) {
+      targetDocId = continuationDocId;
+      await updateDocument(documentId, {
+        status: 'done',
+        parsed_name: 'Дополнительная страница',
+        profile_id: profileId,
+      });
+    } else {
+      await updateDocument(documentId, {
+        status: 'done',
+        profile_id: profileId,
+        parsed_name: result.patient_name,
+        parsed_date: result.test_date,
+        lab_name: result.lab_name,
+        language: result.language,
+        document_type: result.document_type as any,
+        ai_model: model,
+        ai_tokens_in: tokensIn,
+        ai_tokens_out: tokensOut,
+        processing_time_ms: processingTimeMs,
+        parsed_json: result as any,
+      });
+      targetDocId = documentId;
+
+      lastUploadMap.set(account.id, {
+        documentId,
+        profileId,
+        patientName: result.patient_name || null,
+        labName: result.lab_name || null,
+        testDate: result.test_date || null,
+        documentType: result.document_type || null,
+        timestamp: Date.now(),
+      });
+    }
+
+    // 8. Save readings
+    if (profileId) {
+      await saveDocumentReadings(result, targetDocId, profileId, lastState?.testDate);
+    }
+
+    // 9. Increment upload count (skip for continuation pages)
+    if (!isContinuation) {
+      await incrementUploadCount(account.id, account.monthly_uploads);
+    }
+
+    // 10. Send result
+    const text = buildResultMessage(result, isContinuation, remaining, model);
+    await deleteSatus();
+    await bot.api.sendMessage(chatId, text, { parse_mode: 'Markdown' });
+
+  } catch (error: any) {
+    console.error('[ERROR] processDocumentAsync:', error);
+    await deleteSatus();
+    await bot.api.sendMessage(chatId,
+      `❌ Ошибка обработки: ${error.message}\n\nПопробуй отправить документ ещё раз или в другом формате (фото/PDF).`
+    );
+    try { await updateDocument(documentId, { status: 'error', error_message: error.message }); } catch {}
+  }
+}
+
+// ============================================
+// Photo/Document handler — CORE FEATURE
+// ============================================
+
+async function handleLabUpload(ctx: Context, fileId: string, mimeType: string) {
+  const account = await getOrCreateAccount(
+    ctx.from!.id,
+    ctx.from!.username,
+    ctx.from!.first_name
+  );
+
+  // Проверяем лимит загрузок
+  const { allowed, remaining } = await checkUploadLimit(account);
+  if (!allowed) {
+    await ctx.reply(
+      `⚠️ Лимит бесплатных загрузок исчерпан (${account.plan === 'free' ? '3/мес' : '—'}).\n\n` +
+      `Подключи Pro для безлимитных загрузок: /upgrade`,
+    );
+    return;
+  }
+
+  // Feature 5: Send immediate ack
+  const statusMsg = await ctx.reply('✅ Получил! Обрабатываю... ⏳');
+  const chatId = ctx.chat!.id;
+
+  try {
+    // Скачиваем файл из Telegram
+    const file = await ctx.api.getFile(fileId);
+    const fileUrl = `https://api.telegram.org/file/bot${process.env.TELEGRAM_BOT_TOKEN}/${file.file_path}`;
+
+    const response = await fetch(fileUrl);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const base64 = buffer.toString('base64');
+
+    // Загружаем оригинал в Supabase Storage
+    const storagePath = `${account.id}/${Date.now()}_${file.file_path?.split('/').pop() || 'upload'}`;
+
+    await supabase.storage
+      .from('documents')
+      .upload(storagePath, buffer, {
+        contentType: mimeType,
+        upsert: false,
+      });
+
+    // Создаём запись документа
+    const doc = await createDocument({
+      accountId: account.id,
+      storagePath,
+      fileType: mimeType,
+      fileSize: buffer.length,
+      source: 'telegram',
+    });
+
+    await updateDocument(doc.id, { status: 'processing' });
+
+    // Feature 5: Fire async processing without awaiting
+    processDocumentAsync({
+      chatId,
+      statusMsgId: statusMsg.message_id,
+      account,
+      remaining,
+      documentId: doc.id,
+      base64,
+      mimeType,
+    }).catch(async (err) => {
+      console.error('[ERROR] processDocumentAsync unhandled:', err);
+      try { await bot.api.deleteMessage(chatId, statusMsg.message_id); } catch {}
+      await bot.api.sendMessage(chatId, '❌ Ошибка обработки. Попробуйте ещё раз.');
+    });
+
+  } catch (error: any) {
+    console.error('[ERROR] handleLabUpload sync:', error);
+    try { await ctx.api.deleteMessage(chatId, statusMsg.message_id); } catch {}
+    await ctx.reply(`❌ Не удалось загрузить файл: ${error.message}`);
+  }
+}
+
+// Photo handler
+bot.on('message:photo', async (ctx) => {
+  const photo = ctx.message.photo;
+  const largest = photo[photo.length - 1]; // самое большое разрешение
+  await handleLabUpload(ctx, largest.file_id, 'image/jpeg');
+});
+
+// Document handler (PDF)
+bot.on('message:document', async (ctx) => {
+  const doc = ctx.message.document;
+  const allowedTypes = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
+
+  if (!doc.mime_type || !allowedTypes.includes(doc.mime_type)) {
+    await ctx.reply('⚠️ Поддерживаемые форматы: JPG, PNG, PDF. Отправь фото анализа или PDF-файл.');
+    return;
+  }
+
+  await handleLabUpload(ctx, doc.file_id, doc.mime_type);
+});
+
+// ============================================
+// Fallback for text messages (Feature 7: handle name input)
 // ============================================
 
 bot.on('message:text', async (ctx) => {
-  // Ignore commands (already handled)
   if (ctx.message.text.startsWith('/')) return;
+
+  const account = await getOrCreateAccount(ctx.from!.id, ctx.from!.username);
+  const pending = pendingNameMap.get(account.id);
+
+  if (pending) {
+    // Check expiry (10 minutes)
+    if (Date.now() - pending.createdAt > 10 * 60 * 1000) {
+      pendingNameMap.delete(account.id);
+      await updateDocument(pending.documentId, { status: 'error', error_message: 'timeout' });
+      await ctx.reply('⏱️ Время ожидания истекло. Пожалуйста, загрузите документ ещё раз.');
+      return;
+    }
+
+    if (pending.stage === 'enter_name') {
+      const name = ctx.message.text.trim();
+      if (name.length < 2) {
+        await ctx.reply('❌ Пожалуйста, введите корректное имя (минимум 2 символа).');
+        return;
+      }
+      pendingNameMap.delete(account.id);
+      await completePendingDocument(pending, null, name);
+      return;
+    }
+  }
 
   await ctx.reply(
     '📋 Отправь мне фото или PDF анализа — я обработаю его автоматически!\n\nИли используй /help для справки.'
@@ -498,14 +783,10 @@ bot.catch((err) => {
 
 async function main() {
   console.log('🫀 Biopulse bot starting...');
-  
+
   if (process.env.TELEGRAM_MODE === 'webhook') {
-    // Webhook mode (production)
     console.log('Mode: webhook');
-    // bot.api.setWebhook(process.env.TELEGRAM_WEBHOOK_URL!);
-    // Webhook handler будет в Next.js API route
   } else {
-    // Polling mode (development)
     console.log('Mode: polling');
     await bot.start({
       onStart: () => console.log('✅ Biopulse bot is running!'),
