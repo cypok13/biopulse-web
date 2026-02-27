@@ -44,8 +44,12 @@ export interface Document {
   parsed_json: Record<string, unknown> | null;
   parsed_name: string | null;
   parsed_date: string | null;
+  parsed_dob: string | null;
+  parsed_sex: string | null;
+  document_type: string | null;
   lab_name: string | null;
   language: string | null;
+  is_partial: boolean;
   ai_model: string | null;
   ai_cost: number;
   ai_tokens_in: number;

@@ -15,7 +15,7 @@ export default function HomePage() {
             </span>
           </div>
           <a
-            href="https://t.me/biopulse_bot"
+            href="https://t.me/biopulse_lab_bot"
             className="text-xs font-semibold px-4 py-2 rounded-lg bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 hover:bg-cyan-500/20 transition-colors"
           >
             Открыть в Telegram →
@@ -47,7 +47,7 @@ export default function HomePage() {
 
         <div className="flex flex-col sm:flex-row gap-3 mb-16">
           <a
-            href="https://t.me/biopulse_bot"
+            href="https://t.me/biopulse_lab_bot"
             className="inline-flex items-center gap-2 px-6 py-3 rounded-xl bg-gradient-to-r from-cyan-500 to-cyan-600 text-white font-bold text-sm shadow-lg shadow-cyan-500/25 hover:shadow-cyan-500/40 hover:scale-[1.02] transition-all"
           >
             <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69.01-.03.01-.14-.07-.2-.08-.06-.2-.04-.28-.02-.12.03-2.02 1.28-5.69 3.76-.54.37-1.03.55-1.47.54-.48-.01-1.4-.27-2.09-.49-.84-.27-1.51-.42-1.45-.88.03-.24.37-.49 1.02-.74 3.98-1.73 6.64-2.87 7.97-3.43 3.8-1.58 4.59-1.85 5.1-1.86.11 0 .37.03.54.17.14.12.18.28.2.47-.01.06.01.24 0 .37z"/></svg>
@@ -145,7 +145,7 @@ export default function HomePage() {
         <div className="max-w-5xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-slate-600">
           <span>© 2026 Biopulse · Все анализы. Одно место.</span>
           <div className="flex gap-4">
-            <a href="https://t.me/biopulse_bot" className="hover:text-slate-400 transition-colors">Telegram</a>
+            <a href="https://t.me/biopulse_lab_bot" className="hover:text-slate-400 transition-colors">Telegram</a>
             <a href="/privacy" className="hover:text-slate-400 transition-colors">Приватность</a>
           </div>
         </div>

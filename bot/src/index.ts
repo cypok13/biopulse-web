@@ -10,8 +10,27 @@ import {
   checkUploadLimit,
   getProfiles,
   supabase,
+  convertToCanonicalUnit,
+  smartNameKey,
 } from './services/supabase';
 import { parseLabDocument } from './services/ai-parser';
+
+// ============================================
+// Multi-page document tracking (in-memory, resets on restart)
+// ============================================
+
+const MULTI_PAGE_WINDOW_MS = 5 * 60 * 1000; // 5 минут
+
+interface LastUploadState {
+  documentId: string;
+  profileId: string | null;
+  patientName: string | null;
+  labName: string | null;
+  testDate: string | null;
+  timestamp: number;
+}
+
+const lastUploadMap = new Map<string, LastUploadState>();
 
 // ============================================
 // Bot initialization
@@ -216,91 +235,173 @@ async function handleLabUpload(ctx: Context, fileId: string, mimeType: string) {
     await updateDocument(doc.id, { status: 'processing' });
 
     // 5. AI парсинг
-    const { result, model, tokensIn, tokensOut, processingTimeMs } = await parseLabDocument(base64, mimeType);
+    const { result, model, tokensIn, tokensOut, processingTimeMs } = await parseLabDocument(base64, mimeType, undefined, account.locale);
 
-    // 6. Находим или создаём профиль
-    let profileId: string | null = null;
-    if (result.patient_name) {
-      const profile = await findOrCreateProfile(account.id, result.patient_name);
+    // 5b. Проверяем: не является ли это продолжением предыдущего документа (в течение 5 мин)
+    const lastState = lastUploadMap.get(account.id);
+    const withinWindow = lastState && (Date.now() - lastState.timestamp) < MULTI_PAGE_WINDOW_MS;
+
+    let isContinuation = false;
+    let continuationDocId: string | null = null;
+    let continuationProfileId: string | null = null;
+
+    if (withinWindow && lastState) {
+      // Считаем продолжением если: имя пациента отсутствует ИЛИ совпадает, И лаборатория совпадает
+      const noName = !result.patient_name;
+      const sameName = result.patient_name && lastState.patientName &&
+        smartNameKey(result.patient_name) === smartNameKey(lastState.patientName);
+      const noLab = !result.lab_name;
+      const sameLab = result.lab_name && lastState.labName &&
+        result.lab_name.toLowerCase().substring(0, 6) === lastState.labName.toLowerCase().substring(0, 6);
+
+      if ((noName || sameName) && (noLab || sameLab)) {
+        isContinuation = true;
+        continuationDocId = lastState.documentId;
+        continuationProfileId = lastState.profileId;
+        // Продлеваем окно для следующих страниц
+        lastUploadMap.set(account.id, { ...lastState, timestamp: Date.now() });
+      }
+    }
+
+    // 6. Находим или создаём профиль (только для нового документа)
+    let profileId: string | null = isContinuation ? continuationProfileId : null;
+    if (!isContinuation && result.patient_name) {
+      const profile = await findOrCreateProfile(account.id, result.patient_name, account.locale);
       profileId = profile.id;
     }
 
-    // 7. Обновляем документ
-    await updateDocument(doc.id, {
-      status: 'done',
-      profile_id: profileId,
-      parsed_name: result.patient_name,
-      parsed_date: result.test_date,
-      lab_name: result.lab_name,
-      language: result.language,
-      ai_model: model,
-      ai_tokens_in: tokensIn,
-      ai_tokens_out: tokensOut,
-      processing_time_ms: processingTimeMs,
-      parsed_json: result as any,
-    });
+    // 7. Создаём/обновляем документ
+    let targetDocId: string;
+    if (isContinuation && continuationDocId) {
+      targetDocId = continuationDocId;
+      // Добавляем страницу в Storage но к тому же документу не добавляем запись
+    } else {
+      await updateDocument(doc.id, {
+        status: 'done',
+        profile_id: profileId,
+        parsed_name: result.patient_name,
+        parsed_date: result.test_date,
+        lab_name: result.lab_name,
+        language: result.language,
+        document_type: result.document_type as any,
+        ai_model: model,
+        ai_tokens_in: tokensIn,
+        ai_tokens_out: tokensOut,
+        processing_time_ms: processingTimeMs,
+        parsed_json: result as any,
+      });
+      targetDocId = doc.id;
 
-    // 8. Сохраняем показатели
+      // Запоминаем для многостраничной детекции
+      lastUploadMap.set(account.id, {
+        documentId: doc.id,
+        profileId,
+        patientName: result.patient_name || null,
+        labName: result.lab_name || null,
+        testDate: result.test_date || null,
+        timestamp: Date.now(),
+      });
+    }
+
+    // 8. Сохраняем показатели (с конвертацией единиц и нечётким матчингом биомаркеров)
     if (result.readings && result.readings.length > 0 && profileId) {
+      const testedAt = result.test_date || (lastState?.testDate) || new Date().toISOString().split('T')[0];
+
       const readingsToSave = await Promise.all(
-        result.readings.map(async (r) => ({
-          document_id: doc.id,
-          profile_id: profileId!,
-          biomarker_id: await matchBiomarker(r.name) || undefined,
-          original_name: r.name,
-          value: r.value_numeric ? r.value : null,
-          value_text: !r.value_numeric ? String(r.value) : null,
-          is_qualitative: !r.value_numeric,
-          unit: r.unit || undefined,
-          ref_min: r.ref_min || undefined,
-          ref_max: r.ref_max || undefined,
-          flag: r.flag || 'normal',
-          tested_at: result.test_date || new Date().toISOString().split('T')[0],
-        }))
+        result.readings.map(async (r) => {
+          const bmMatch = await matchBiomarker(r.name);
+
+          let numericValue: number | null = r.value_numeric ? Number(r.value) : null;
+          let unit = r.unit || undefined;
+          let refMin = r.ref_min || undefined;
+          let refMax = r.ref_max || undefined;
+
+          // Конвертация единиц в canonical если нужно
+          if (bmMatch?.unit_default && numericValue !== null && unit) {
+            const converted = convertToCanonicalUnit(numericValue, unit, bmMatch.unit_default, bmMatch.canonical_name);
+            if (converted.unit !== unit) {
+              // Пересчитываем референсные значения с тем же коэффициентом
+              const factor = converted.value / numericValue;
+              numericValue = converted.value;
+              unit = converted.unit;
+              if (refMin !== undefined) refMin = Math.round(refMin * factor * 10000) / 10000;
+              if (refMax !== undefined) refMax = Math.round(refMax * factor * 10000) / 10000;
+            }
+          }
+
+          return {
+            document_id: targetDocId,
+            profile_id: profileId!,
+            biomarker_id: bmMatch?.id || undefined,
+            original_name: r.name,
+            value: numericValue,
+            value_text: !r.value_numeric ? String(r.value) : null,
+            is_qualitative: !r.value_numeric,
+            unit,
+            ref_min: refMin,
+            ref_max: refMax,
+            flag: r.flag || 'normal',
+            tested_at: testedAt,
+          };
+        })
       );
 
       await saveReadings(readingsToSave as any);
     }
 
-    // 9. Обновляем счётчик загрузок
-    await supabase
-      .from('accounts')
-      .update({ monthly_uploads: account.monthly_uploads + 1 })
-      .eq('id', account.id);
+    // Если продолжение — дополнительная страница в Storage не требует отдельного счётчика
+    if (!isContinuation) {
+      // 9. Обновляем счётчик загрузок
+      await supabase
+        .from('accounts')
+        .update({ monthly_uploads: account.monthly_uploads + 1 })
+        .eq('id', account.id);
+    } else {
+      // Помечаем вспомогательный документ как обработанный (он уже создан как pending)
+      await updateDocument(doc.id, { status: 'done', parsed_name: 'Дополнительная страница' });
+    }
 
     // 10. Формируем ответ
     const readingsCount = result.readings?.length || 0;
     const flaggedCount = result.readings?.filter(r => r.flag !== 'normal').length || 0;
 
-    let responseText = `✅ *Анализ обработан!*\n\n`;
+    let responseText: string;
 
-    if (result.patient_name) {
-      responseText += `👤 Пациент: *${result.patient_name}*\n`;
-    }
-    if (result.test_date) {
-      responseText += `📅 Дата: ${result.test_date}\n`;
-    }
-    if (result.lab_name) {
-      responseText += `🏥 Лаборатория: ${result.lab_name}\n`;
-    }
+    if (isContinuation) {
+      responseText = `📎 *Продолжение анализа добавлено!*\n\n`;
+      responseText += `📊 Добавлено показателей: *${readingsCount}*\n`;
+    } else {
+      responseText = `✅ *Анализ обработан!*\n\n`;
 
-    responseText += `\n📊 Найдено показателей: *${readingsCount}*\n`;
+      if (result.patient_name) {
+        responseText += `👤 Пациент: *${result.patient_name}*\n`;
+      }
+      if (result.test_date) {
+        responseText += `📅 Дата: ${result.test_date}\n`;
+      }
+      if (result.lab_name) {
+        responseText += `🏥 Лаборатория: ${result.lab_name}\n`;
+      }
+
+      responseText += `\n📊 Найдено показателей: *${readingsCount}*\n`;
+    }
 
     if (flaggedCount > 0) {
       responseText += `⚠️ Вне нормы: *${flaggedCount}*\n\n`;
 
-      // Показываем показатели вне нормы
       const flagged = result.readings?.filter(r => r.flag !== 'normal') || [];
       for (const r of flagged.slice(0, 10)) {
         const emoji = r.flag === 'high' ? '🔴↑' : r.flag === 'low' ? '🔵↓' : '⚠️';
         responseText += `${emoji} ${r.name}: *${r.value}* ${r.unit || ''}\n`;
       }
-    } else {
+    } else if (!isContinuation) {
       responseText += `✅ Все показатели в норме\n`;
     }
 
     responseText += `\n📊 /dashboard — посмотреть графики`;
-    responseText += `\n\n_Осталось загрузок: ${remaining - 1} | ${model}_`;
+    if (!isContinuation) {
+      responseText += `\n\n_Осталось загрузок: ${remaining - 1} | ${model}_`;
+    }
 
     // Удаляем сообщение о обработке и отправляем результат
     await ctx.api.deleteMessage(ctx.chat!.id, statusMsg.message_id);

@@ -7,10 +7,15 @@ import type { ParsedLabResult } from '../../../shared/types';
 // AI Parser — Claude Vision + GPT-4o
 // ============================================
 
-const PARSE_PROMPT = `You are a medical lab results parser. Extract structured data from the uploaded medical lab report.
+function buildParsePrompt(locale: string): string {
+  const nameScriptInstruction = locale === 'ru'
+    ? 'Return patient_name in Cyrillic (Russian) script. If the name is in Latin, transliterate it to Russian Cyrillic (e.g., "Krasnova Evgeniia" → "Краснова Евгения").'
+    : 'Return patient_name in Latin script. If the name is in Cyrillic, transliterate it to Latin (e.g., "Краснова Евгения" → "Krasnova Evgenia").';
+
+  return `You are a medical lab results parser. Extract structured data from the uploaded medical lab report.
 
 RULES:
-1. Extract patient's full name exactly as written. If "Prezime" (surname) and "Ime" (name) are separate, combine as "Surname Firstname"
+1. Extract patient's full name. If "Prezime" (surname) and "Ime" (name) are separate, combine as "Surname Firstname". ${nameScriptInstruction}
 2. Extract test date in ISO format (YYYY-MM-DD). Convert DD.MM.YYYY or DD/MM/YYYY to ISO
 3. Extract lab/clinic name
 4. Detect document language (sr, ru, en, de, etc.)
@@ -63,6 +68,7 @@ Return ONLY valid JSON:
 }
 
 No markdown formatting. No text outside the JSON object. Use null for unknown values.`;
+}
 
 // ============================================
 // PDF text extraction helper
@@ -78,7 +84,7 @@ async function extractPdfText(base64: string): Promise<string> {
 // Claude Vision Parser
 // ============================================
 
-async function parseWithClaude(imageBase64: string, mimeType: string): Promise<{
+async function parseWithClaude(imageBase64: string, mimeType: string, prompt: string): Promise<{
   result: ParsedLabResult;
   model: string;
   tokensIn: number;
@@ -117,7 +123,7 @@ async function parseWithClaude(imageBase64: string, mimeType: string): Promise<{
         role: 'user',
         content: [
           contentBlock,
-          { type: 'text', text: PARSE_PROMPT },
+          { type: 'text', text: prompt },
         ],
       },
     ],
@@ -143,7 +149,7 @@ async function parseWithClaude(imageBase64: string, mimeType: string): Promise<{
 // GPT-4o Vision Parser
 // ============================================
 
-async function parseWithOpenAI(imageBase64: string, mimeType: string): Promise<{
+async function parseWithOpenAI(imageBase64: string, mimeType: string, prompt: string): Promise<{
   result: ParsedLabResult;
   model: string;
   tokensIn: number;
@@ -165,7 +171,7 @@ async function parseWithOpenAI(imageBase64: string, mimeType: string): Promise<{
     messageContent = [
       {
         type: 'text',
-        text: `Текст медицинского документа (PDF):\n\n${pdfText}\n\n${PARSE_PROMPT}`,
+        text: `Текст медицинского документа (PDF):\n\n${pdfText}\n\n${prompt}`,
       },
     ];
   } else {
@@ -176,7 +182,7 @@ async function parseWithOpenAI(imageBase64: string, mimeType: string): Promise<{
           url: `data:${mimeType};base64,${imageBase64}`,
         },
       },
-      { type: 'text', text: PARSE_PROMPT },
+      { type: 'text', text: prompt },
     ];
   }
 
@@ -212,7 +218,8 @@ async function parseWithOpenAI(imageBase64: string, mimeType: string): Promise<{
 export async function parseLabDocument(
   imageBase64: string,
   mimeType: string,
-  provider?: 'claude' | 'openai'
+  provider?: 'claude' | 'openai',
+  locale?: string
 ): Promise<{
   result: ParsedLabResult;
   model: string;
@@ -221,6 +228,7 @@ export async function parseLabDocument(
   processingTimeMs: number;
 }> {
   const startTime = Date.now();
+  const prompt = buildParsePrompt(locale || 'en');
 
   // Определяем провайдера
   const aiProvider = provider || process.env.AI_PROVIDER || 'claude';
@@ -234,19 +242,19 @@ export async function parseLabDocument(
 
     try {
       parseResult = useClaude
-        ? await parseWithClaude(imageBase64, mimeType)
-        : await parseWithOpenAI(imageBase64, mimeType);
+        ? await parseWithClaude(imageBase64, mimeType, prompt)
+        : await parseWithOpenAI(imageBase64, mimeType, prompt);
     } catch (error) {
       // Fallback на другой провайдер
       console.warn(`[AI] Primary failed, trying fallback...`);
       parseResult = useClaude
-        ? await parseWithOpenAI(imageBase64, mimeType)
-        : await parseWithClaude(imageBase64, mimeType);
+        ? await parseWithOpenAI(imageBase64, mimeType, prompt)
+        : await parseWithClaude(imageBase64, mimeType, prompt);
     }
   } else if (aiProvider === 'openai') {
-    parseResult = await parseWithOpenAI(imageBase64, mimeType);
+    parseResult = await parseWithOpenAI(imageBase64, mimeType, prompt);
   } else {
-    parseResult = await parseWithClaude(imageBase64, mimeType);
+    parseResult = await parseWithClaude(imageBase64, mimeType, prompt);
   }
 
   const processingTimeMs = Date.now() - startTime;
