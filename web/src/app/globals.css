@@ -2,11 +2,32 @@
 @tailwind components;
 @tailwind utilities;
 
-* {
-  box-sizing: border-box;
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;600&display=swap');
+
+:root {
+  --bg-0: #0b0b18;
+  --bg-1: #12121f;
+  --bg-2: #1a1a2e;
+  --accent: #06b6d4;
+  --accent-light: #67e8f9;
 }
 
 body {
-  background-color: #0b0b18;
-  color: #f1f5f9;
+  background: var(--bg-0);
+  color: #e2e8f0;
+  font-family: 'Outfit', system-ui, sans-serif;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #475569; }
+
+/* Subtle dot pattern background */
+.bg-dots {
+  background-image:
+    radial-gradient(circle at 25% 25%, rgba(6,182,212,0.03) 1px, transparent 1px),
+    radial-gradient(circle at 75% 75%, rgba(139,92,246,0.03) 1px, transparent 1px);
+  background-size: 60px 60px;
 }
