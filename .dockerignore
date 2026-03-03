@@ -1,0 +1,14 @@
+node_modules/
+bot/node_modules/
+web/node_modules/
+bot/dist/
+web/.next/
+web/out/
+web/
+.git/
+.claude/
+*.log
+*.bak
+.env
+.env.local
+bot/.env
