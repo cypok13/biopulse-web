@@ -36,3 +36,7 @@ web/next-env.d.ts
 
 # Misc
 .turbo/
+*.bak
+
+# Claude Code (local settings only)
+.claude/settings.local.json
