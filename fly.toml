@@ -1,5 +1,5 @@
 app = "biopulse-bot"
-primary_region = "ams"  # Amsterdam — ближе к EU
+primary_region = "ams"
 
 [build]
   dockerfile = "Dockerfile"
@@ -9,17 +9,8 @@ primary_region = "ams"  # Amsterdam — ближе к EU
   TELEGRAM_MODE = "polling"
   AI_PROVIDER = "openai"
 
-# Бот работает в polling-режиме — HTTP не нужен.
-# Один инстанс всегда запущен.
-[machines]
-  [machines.default]
-    memory = "256mb"
-    cpus = 1
-
+# Бот работает в polling-режиме — HTTP не нужен, один инстанс всегда запущен.
 [[vm]]
   memory = "256mb"
   cpu_kind = "shared"
   cpus = 1
-
-[restart]
-  policy = "always"
